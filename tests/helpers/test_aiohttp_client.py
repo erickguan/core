@@ -1,5 +1,6 @@
 """Test the aiohttp client helper."""
 
+import asyncio
 from collections.abc import AsyncGenerator
 import socket
 from unittest.mock import Mock, patch
@@ -169,6 +170,63 @@ async def test_create_clientsession_without_ssl_and_cookies(
     assert client.DATA_CLIENTSESSION not in hass.data
     connector = hass.data[client.DATA_CONNECTOR][(verify_ssl, family, ssl_cipher)]
     assert isinstance(connector, aiohttp.TCPConnector)
+
+
+@pytest.fixture
+async def proxy_server() -> AsyncGenerator[tuple[int, list[str]]]:
+    """Start a minimal HTTP proxy that records request lines."""
+
+    request_lines: list[str] = []
+
+    async def handle_client(
+        reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
+        """Record the proxy request and reply with a 200 OK."""
+        request_line = await reader.readline()
+        request_lines.append(request_line.decode("ascii").rstrip("\r\n"))
+
+        while True:
+            header_line = await reader.readline()
+            if header_line in {b"\r\n", b""}:
+                break
+
+        writer.write(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok"
+        )
+        await writer.drain()
+        writer.close()
+        await writer.wait_closed()
+
+    server = await asyncio.start_server(handle_client, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+
+    try:
+        yield port, request_lines
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+@pytest.mark.usefixtures("socket_enabled")
+async def test_create_clientsession_uses_env_proxy(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+    proxy_server: tuple[int, list[str]],
+) -> None:
+    """Test create clientsession honors HTTP proxy environment variables."""
+    proxy_port, request_lines = proxy_server
+    proxy_url = f"http://127.0.0.1:{proxy_port}"
+    monkeypatch.setenv("HTTP_PROXY", proxy_url)
+    monkeypatch.setenv("http_proxy", proxy_url)
+    monkeypatch.delenv("NO_PROXY", raising=False)
+    monkeypatch.delenv("no_proxy", raising=False)
+
+    session = client.async_create_clientsession(hass)
+    resp = await session.get("http://example.invalid/resource")
+
+    assert resp.status == 200
+    assert await resp.text() == "ok"
+    assert request_lines == ["GET http://example.invalid/resource HTTP/1.1"]
 
 
 @pytest.mark.parametrize(

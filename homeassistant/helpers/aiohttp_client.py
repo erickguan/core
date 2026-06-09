@@ -292,6 +292,7 @@ def _async_create_clientsession(
         json_serialize=json_dumps,
         response_class=HassClientResponse,
         middlewares=middlewares,
+        trust_env=True,
         **kwargs,
     )
     # Prevent packages accidentally overriding our default headers
